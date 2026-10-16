@@ -42,16 +42,63 @@ const RESULT = {
   score: 0.0163934426229508,
 };
 
-/** A stub of the two function endpoints, with a mode the tests can set. */
-async function startUpstream() {
-  const state = { mode: "ok", submitted: 0, polled: 0 };
+/** A document in the caller's own library, as `GET /documents` answers it. */
+const LIBRARY_DOCUMENT = {
+  id: "lib:22a615eb-e7ae-4ef4-9d9a-baecbf720dae",
+  title: "adaptive-harness-proposal.pdf",
+  filename: "adaptive-harness-proposal.pdf",
+  source: "library",
+  passages: 12,
+};
 
-  const server = createServer((request, response) => {
+/** A document from the open corpus. */
+const PUBLIC_DOCUMENT = {
+  id: "pg:78",
+  title: "Tarzan of the Apes",
+  filename: "78",
+  source: "public",
+  passages: 381,
+};
+
+/** A stub of the three function endpoints, with a mode the tests can set. */
+async function startUpstream() {
+  const state = {
+    mode: "ok",
+    submitted: 0,
+    polled: 0,
+    // What the last search actually put on the wire. A scope is the one argument
+    // whose absence and default are dangerous to confuse, so the tests read the body
+    // rather than trusting the tool's own report of what it did.
+    lastBody: null,
+    documentQueries: [],
+    // Deletions the stub was asked for, and whether the id it was given is one it
+    // knows. A `404` here stands in for both "no such document" and "not yours".
+    deleted: [],
+    library: [LIBRARY_DOCUMENT],
+    matches: {
+      "Tarzan of the Apes": [PUBLIC_DOCUMENT],
+      tarzan: [PUBLIC_DOCUMENT],
+      "adaptive-harness-proposal.pdf": [LIBRARY_DOCUMENT],
+    },
+  };
+
+  const readBody = (request) =>
+    new Promise((done) => {
+      let text = "";
+      request.on("data", (chunk) => {
+        text += chunk;
+      });
+      request.on("end", () => done(text));
+    });
+
+  const server = createServer(async (request, response) => {
     const send = (status, body) =>
       response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
 
     if (request.method === "POST" && request.url === "/retrieve") {
       state.submitted += 1;
+      const text = await readBody(request);
+      state.lastBody = text === "" ? null : JSON.parse(text);
       if (state.mode === "spent") return send(402, { error: "insufficient_credit" });
       if (state.mode === "revoked") return send(401, { error: "invalid_api_key" });
       return send(202, { job_id: "job-1", status: "pending", interval: 0 });
@@ -62,6 +109,30 @@ async function startUpstream() {
         status: "complete",
         results: [state.result ?? RESULT],
         retrieval_ms: 123,
+      });
+    }
+    // The naming route: no `q` is the whole library, `q` is a lookup across the
+    // caller's library and the public corpus. A path id is a deletion.
+    if (request.url.startsWith("/documents")) {
+      const url = new URL(request.url, "http://upstream");
+      const tail = url.pathname.split("/").filter(Boolean).pop() ?? "";
+
+      if (tail !== "documents") {
+        if (request.method !== "DELETE") return send(405, { error: "method_not_allowed" });
+        const id = decodeURIComponent(tail);
+        state.deleted.push(id);
+        // Only the library's own document can be deleted; anything else is as
+        // absent as another tenant's document is.
+        if (id !== LIBRARY_DOCUMENT.id) return send(404, { error: "not_found" });
+        return send(200, { id, storage_removed: true });
+      }
+
+      if (request.method !== "GET") return send(405, { error: "method_not_allowed" });
+      const q = url.searchParams.get("q") ?? "";
+      state.documentQueries.push(q);
+      return send(200, {
+        query: q === "" ? null : q,
+        documents: q === "" ? state.library : (state.matches[q] ?? []),
       });
     }
     send(404, { error: "not_found" });
@@ -177,13 +248,20 @@ describe("the retrievr MCP server", async () => {
     assert.equal(typeof answer.result.capabilities.tools, "object");
   });
 
-  it("offers one search tool, and asks for a query", async () => {
+  it("offers the search tool and the naming tool", async () => {
     const answer = await withKey.request("tools/list", {});
     const tools = answer.result.tools;
-    assert.equal(tools.length, 1);
-    assert.equal(tools[0].name, "retrievr_search");
-    assert.equal(tools[0].inputSchema.required.includes("query"), true);
-    assert.equal(tools[0].inputSchema.properties.query.type, "string");
+    assert.deepEqual(
+      tools.map((tool) => tool.name),
+      ["retrievr_search", "retrievr_documents", "retrievr_delete_document"],
+    );
+    const search = tools[0];
+    assert.equal(search.inputSchema.required.includes("query"), true);
+    assert.equal(search.inputSchema.properties.query.type, "string");
+    // The scope is what the whole private-library feature turns on, so the schema
+    // has to offer it — a model cannot ask for a scope it cannot see.
+    assert.deepEqual(search.inputSchema.properties.scope.enum, ["all", "public", "private"]);
+    assert.equal(search.inputSchema.properties.documents.type, "array");
   });
 
   it("answers a query with cited passages", async () => {
@@ -297,6 +375,122 @@ describe("the retrievr MCP server", async () => {
     } finally {
       upstream.state.mode = "ok";
     }
+  });
+
+  // --- the scope, and naming a document ------------------------------------
+
+  it("sends the scope it was asked for, and sends nothing when it was not", async () => {
+    await withKey.request("tools/call", {
+      name: "retrievr_search",
+      arguments: { query: "only mine", scope: "private" },
+    });
+    assert.deepEqual(upstream.state.lastBody.scope, { type: "private", ids: [] });
+    assert.match(upstream.state.lastBody.query, /only mine/);
+
+    await withKey.request("tools/call", {
+      name: "retrievr_search",
+      arguments: { query: "everything" },
+    });
+    // Absent rather than defaulted here: "I forgot the scope" and "search
+    // everything" must not look the same on the wire, or a dropped argument
+    // silently widens a private search to the whole corpus.
+    assert.equal(upstream.state.lastBody.scope, undefined);
+  });
+
+  it("refuses a scope it does not have, rather than widening the search", async () => {
+    const before = upstream.state.submitted;
+    const answer = await withKey.request("tools/call", {
+      name: "retrievr_search",
+      arguments: { query: "anything", scope: "privat" },
+    });
+    assert.equal(answer.result.isError, true);
+    assert.match(textOf(answer), /scope/i);
+    // Nothing was submitted, so nothing was charged for a query nobody could scope.
+    assert.equal(upstream.state.submitted, before);
+  });
+
+  it("turns a named document into the ids the scope takes", async () => {
+    const answer = await withKey.request("tools/call", {
+      name: "retrievr_search",
+      arguments: { query: "what does it propose?", documents: ["Tarzan of the Apes"] },
+    });
+    assert.deepEqual(upstream.state.lastBody.scope, { type: "documents", ids: ["pg:78"] });
+    // The answer says which documents were searched, so a person can tell a narrow
+    // search from a wide one without reading the JSON.
+    assert.match(textOf(answer), /scope: documents/);
+    assert.match(textOf(answer), /Tarzan of the Apes/);
+  });
+
+  it("fails rather than searching wider when a named document does not exist", async () => {
+    const before = upstream.state.submitted;
+    const answer = await withKey.request("tools/call", {
+      name: "retrievr_search",
+      arguments: { query: "anything", documents: ["the lease"] },
+    });
+    assert.equal(answer.result.isError, true);
+    assert.match(textOf(answer), /the lease/);
+    // And what they do have, so the model recovers without a second guess.
+    assert.match(textOf(answer), /adaptive-harness-proposal/);
+    // The whole point: a name that resolved to nothing did not become a search of
+    // everything.
+    assert.equal(upstream.state.submitted, before);
+  });
+
+  it("lists the library, and finds a document by name", async () => {
+    const listed = await withKey.request("tools/call", {
+      name: "retrievr_documents",
+      arguments: {},
+    });
+    assert.match(textOf(listed), /adaptive-harness-proposal\.pdf/);
+    assert.match(textOf(listed), /lib:22a615eb/);
+    assert.equal(upstream.state.documentQueries.at(-1), "");
+
+    const found = await withKey.request("tools/call", {
+      name: "retrievr_documents",
+      arguments: { query: "tarzan" },
+    });
+    assert.match(textOf(found), /Tarzan of the Apes/);
+    // Whose it is, because "a book I can search" and "my own file" are different
+    // answers to "where did this come from".
+    assert.match(textOf(found), /public corpus/);
+  });
+
+  // --- deleting a document --------------------------------------------------
+
+  it("deletes the id it was given, and says what happened", async () => {
+    const answer = await withKey.request("tools/call", {
+      name: "retrievr_delete_document",
+      arguments: { doc_id: LIBRARY_DOCUMENT.id },
+    });
+    assert.notEqual(answer.result.isError, true);
+    assert.match(textOf(answer), /Deleted/);
+    assert.match(textOf(answer), /lib:22a615eb/);
+    // The id reaches the API as a path segment, encoded — `lib:<uuid>` carries a
+    // colon, and a colon in the wrong place is a different route.
+    assert.deepEqual(upstream.state.deleted, [LIBRARY_DOCUMENT.id]);
+  });
+
+  it("cannot delete an id that is not the caller's, and says nothing was", async () => {
+    const before = upstream.state.deleted.length;
+    const answer = await withKey.request("tools/call", {
+      name: "retrievr_delete_document",
+      arguments: { doc_id: "lib:00000000-0000-0000-0000-000000000000" },
+    });
+    assert.equal(answer.result.isError, true);
+    assert.match(textOf(answer), /nothing was deleted/i);
+    // It was *asked* — the API is what refuses, not the client's opinion of ids.
+    assert.equal(upstream.state.deleted.length, before + 1);
+  });
+
+  it("refuses an empty id rather than deleting something", async () => {
+    const before = upstream.state.deleted.length;
+    const answer = await withKey.request("tools/call", {
+      name: "retrievr_delete_document",
+      arguments: {},
+    });
+    assert.equal(answer.result.isError, true);
+    assert.match(textOf(answer), /doc_id is required/i);
+    assert.equal(upstream.state.deleted.length, before);
   });
 });
 

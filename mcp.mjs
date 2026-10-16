@@ -98,6 +98,19 @@ const PASSAGE_CHARS = 9000;
  */
 const DEFAULT_K = 3;
 
+/**
+ * The plain scopes the API accepts, and the one a query gets when it says nothing.
+ *
+ * `all` is the default because it is what a person means by "ask retrievr": their
+ * own documents are part of what they have. The fourth scope, `documents`, is not
+ * in this list because a caller never spells it — they name documents, and
+ * `scopeFor` turns that into the ids it takes.
+ */
+const SCOPES = ["all", "public", "private"];
+
+/** How many documents one call may name. The API's own ceiling on `scope.ids` is 100. */
+const MAX_DOCUMENT_NAMES = 20;
+
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 function baseUrl() {
@@ -289,12 +302,18 @@ async function readError(response) {
  * Returns a value rather than throwing for anything the caller can act on, so
  * every failure below reaches the model as a sentence.
  */
-async function search(query, k) {
+async function search(query, k, scope) {
   const key = apiKey();
   if (key === undefined) return { ok: false, message: NO_KEY };
 
   const headers = { "content-type": "application/json", authorization: `Bearer ${key}` };
-  const body = k === undefined ? { query } : { query, k };
+  // `k` is omitted rather than defaulted here, so the API's own default stays the
+  // one place it is written down. The scope is the opposite: it is sent whenever
+  // the caller asked for one, because "I forgot the scope" and "search everything"
+  // must not look the same on the wire.
+  const body = { query };
+  if (k !== undefined) body.k = k;
+  if (scope !== undefined) body.scope = scope;
 
   let submitted;
   try {
@@ -368,6 +387,210 @@ function format(results, retrievalMs) {
   return `${blocks.join("\n\n")}\n\nretrieval ${retrievalMs}ms`;
 }
 
+// --- naming a document ------------------------------------------------------
+
+/**
+ * What a name resolves to: the caller's library, and the public corpus.
+ *
+ * `undefined` is "the service could not be reached" and `[]` is "nothing is called
+ * that". The distinction is the caller's to keep: one is worth retrying, the other
+ * is worth telling the human about, and a tool that collapses them sends the model
+ * looking for a network problem that does not exist.
+ */
+async function documentsNamed(name) {
+  const key = apiKey();
+  if (key === undefined) return undefined;
+
+  const query = name === "" ? "" : `?q=${encodeURIComponent(name)}`;
+  try {
+    const response = await fetch(`${baseUrl()}/documents${query}`, {
+      headers: { authorization: `Bearer ${key}` },
+    });
+    if (!response.ok) return undefined;
+    const body = await response.json();
+    return Array.isArray(body?.documents) ? body.documents : [];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The scope a call asks for, from its `scope` and `documents` arguments.
+ *
+ * `documents` wins when both arrive. A caller who names documents has said
+ * something more specific than `scope: "all"`, and the API drops `ids` that come
+ * with any other type — so honouring both would mean the names were silently
+ * ignored and the search ran wider than the request.
+ *
+ * A name that resolves to nothing **fails the call** rather than widening it. The
+ * alternative is a search that charges for a query, answers from the whole corpus,
+ * and looks to the person exactly like the document they named was searched.
+ */
+async function scopeFor(args) {
+  const named = args?.documents;
+  const plain = args?.scope;
+
+  if (named === undefined) {
+    if (plain === undefined) return {};
+    if (typeof plain !== "string" || !SCOPES.includes(plain)) {
+      return { error: `retrievr: scope must be one of ${SCOPES.join(", ")}.` };
+    }
+    return { scope: { type: plain, ids: [] }, note: plain === "all" ? undefined : `scope: ${plain}` };
+  }
+
+  if (!Array.isArray(named) || named.length === 0) {
+    return { error: "retrievr: documents must be a non-empty list of document names or ids." };
+  }
+  if (named.length > MAX_DOCUMENT_NAMES) {
+    return { error: `retrievr: name at most ${MAX_DOCUMENT_NAMES} documents in one call.` };
+  }
+
+  const found = [];
+  const missing = [];
+  for (const entry of named) {
+    const name = typeof entry === "string" ? entry.trim() : "";
+    if (name === "") continue;
+
+    const matches = await documentsNamed(name);
+    if (matches === undefined) {
+      return { error: "retrievr: could not reach the service to resolve a document name." };
+    }
+    if (matches.length === 0) {
+      missing.push(name);
+      continue;
+    }
+    found.push(...matches);
+  }
+
+  if (missing.length > 0) {
+    const held = (await documentsNamed("")) ?? [];
+    const names = missing.map((name) => `"${name}"`).join(" or ");
+    const library =
+      held.length === 0
+        ? "The user's library is empty. Name a document from the public corpus, or search with scope \"public\"."
+        : `Their library holds: ${held.map((doc) => doc.title).join(", ")}.`;
+    return { error: `retrievr: nothing in the user's library or the public corpus is called ${names}. ${library}` };
+  }
+
+  const ids = [...new Set(found.map((doc) => doc.id))];
+  return {
+    scope: { type: "documents", ids },
+    note: `scope: documents — ${found.map((doc) => `${doc.title} [${doc.id}]`).join("; ")}`,
+  };
+}
+
+/** One document, as a result line: what it is, what to call it, whose it is, whether it answers. */
+function documentLine(doc, index) {
+  const where = doc.source === "public" ? "public corpus" : "the user's library";
+  const ready = doc.passages > 0 ? `${doc.passages} passages` : "not retrievable yet";
+  return `${index + 1}. ${doc.title}  [${doc.id}]  ${where}, ${ready}`;
+}
+
+/**
+ * `retrievr_documents`, as a tool result.
+ *
+ * A listing and a lookup are the same call with and without a name, because they
+ * are the same question — "what can I name?" — and a model that has two tools for it
+ * has to know which one it wants before it knows what exists.
+ */
+async function documentsResult(rawQuery) {
+  const query = typeof rawQuery === "string" ? rawQuery.trim() : "";
+  const documents = await documentsNamed(query);
+
+  if (documents === undefined) {
+    return textResult("retrievr: could not reach the service to list documents.", true);
+  }
+
+  if (query === "") {
+    if (documents.length === 0) {
+      return textResult(
+        "The user's retrievr library is empty — nothing has been uploaded to it yet. " +
+          "The public corpus is still searchable with retrievr_search.",
+      );
+    }
+    return textResult(
+      [
+        `The user's library holds ${documents.length} document${documents.length === 1 ? "" : "s"}:`,
+        ...documents.map(documentLine),
+        "",
+        "Pass any of these names to retrievr_search's `documents` argument to search only it.",
+      ].join("\n"),
+    );
+  }
+
+  if (documents.length === 0) {
+    return textResult(
+      `Nothing in the user's library or the public corpus is called "${query}". ` +
+        "Call this tool with no query to see what they do have, or ask them for the exact title.",
+    );
+  }
+
+  return textResult(
+    [
+      `${documents.length} document${documents.length === 1 ? "" : "s"} matching "${query}":`,
+      ...documents.map(documentLine),
+      "",
+      "Pass a name to retrievr_search's `documents` argument to search only that document (or that list).",
+    ].join("\n"),
+  );
+}
+
+/**
+ * `retrievr_delete_document`, as a tool result.
+ *
+ * The only destructive tool here, and the reason its description makes the model
+ * confirm a title before it acts: "delete the lease" and "delete the lease renewal"
+ * are the same request until somebody reads one back. The id is required and never
+ * inferred — a name would resolve to whatever ranked first, and the first result of
+ * a fuzzy match is not a thing to delete sight unseen.
+ */
+async function deleteResult(rawId) {
+  const docId = typeof rawId === "string" ? rawId.trim() : "";
+  if (docId === "") {
+    return textResult(
+      "retrievr: doc_id is required, and nothing was deleted. Call retrievr_documents " +
+        "to see the user's document ids.",
+      true,
+    );
+  }
+
+  const key = apiKey();
+  if (key === undefined) return textResult(NO_KEY, true);
+
+  let response;
+  try {
+    response = await fetch(`${baseUrl()}/documents/${encodeURIComponent(docId)}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${key}` },
+    });
+  } catch (cause) {
+    return textResult(`retrievr: could not reach the service (${cause.message}).`, true);
+  }
+
+  if (response.status === 404) {
+    return textResult(
+      `retrievr: nothing of the user's was called ${docId}, so nothing was deleted. ` +
+        "Call retrievr_documents to see what they do have.",
+      true,
+    );
+  }
+  if (!response.ok) {
+    return textResult(explain(response.status, await readError(response)), true);
+  }
+
+  const body = await response.json().catch(() => ({}));
+  // Said only when it is true, because it is the one part of a deletion that is not
+  // finished: the row is gone and the place is free either way.
+  const tidy =
+    body?.storage_removed === false
+      ? " The stored file is still being tidied up; that does not change what the user can see or search."
+      : "";
+
+  return textResult(
+    `Deleted ${body?.id ?? docId}. It is gone from their library and from retrieval, and its place is free.${tidy}`,
+  );
+}
+
 function textResult(text, isError = false) {
   return { content: [{ type: "text", text }], isError };
 }
@@ -376,10 +599,13 @@ const TOOL = {
   name: TOOL_NAME,
   title: "Search retrievr",
   description:
-    "Search retrievr's corpus of openly licensed documents and get passages back with their " +
-    "citation: source, author, section, character range and licence. Use this instead of " +
-    "answering from memory when a question is about a document retrievr may hold, and cite " +
-    "the fields it returns.",
+    "Search retrievr and get passages back with their citation: source, author, section, " +
+    "character range and licence. Use this instead of answering from memory when a question is " +
+    "about a document retrievr may hold, and cite the fields it returns. " +
+    "By default this searches the user's own documents *and* the public corpus together; pass " +
+    'scope: "private" to search only their documents, scope: "public" for only the open ' +
+    "corpus, or documents: [\"a title or id\"] to search one document or a list of them " +
+    "(use retrievr_documents to find the names).",
   inputSchema: {
     type: "object",
     properties: {
@@ -393,8 +619,70 @@ const TOOL = {
         maximum: 50,
         description: `How many passages to return. Defaults to ${DEFAULT_K}.`,
       },
+      scope: {
+        type: "string",
+        enum: SCOPES,
+        description:
+          'What to search: "all" (the user\'s documents and the public corpus, the default), ' +
+          '"private" (only the user\'s own documents), or "public" (only the openly licensed corpus).',
+      },
+      documents: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "Search only these documents. Each entry is a title, a filename or an id from " +
+          "retrievr_documents, and a title matches the documents that contain it. When this is " +
+          "given it decides the scope; `scope` is ignored.",
+      },
     },
     required: ["query"],
+    additionalProperties: false,
+  },
+};
+
+const DOCUMENTS_TOOL = {
+  name: "retrievr_documents",
+  title: "See retrievr's documents",
+  description:
+    "List the documents in the user's private retrievr library, or find a document by name " +
+    "across their library and the public corpus. Call it with no arguments when the user asks " +
+    "what is in their library, or before a search when they name a document — then pass that " +
+    "name to retrievr_search's `documents` argument to search only it.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description:
+          "A title, filename or id to look for, in the user's library and the public corpus. " +
+          "Omit it to list the user's own library.",
+      },
+    },
+    required: [],
+    additionalProperties: false,
+  },
+};
+
+const DELETE_TOOL = {
+  name: "retrievr_delete_document",
+  title: "Delete a retrievr document",
+  description:
+    "Permanently remove one of the user's own uploaded documents, freeing its place in their " +
+    "library (the library holds twenty). This cannot be undone and there is no trash, so before " +
+    "calling it: find the document with retrievr_documents, say its exact title back to the " +
+    "user, and delete only the id they confirm. Never guess an id and never delete as a tidy-up. " +
+    "Documents from the public corpus cannot be deleted.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      doc_id: {
+        type: "string",
+        description:
+          "The id of the document to delete, exactly as retrievr_documents returned it " +
+          "(for example lib:22a615eb-e7ae-4ef4-9d9a-baecbf720dae).",
+      },
+    },
+    required: ["doc_id"],
     additionalProperties: false,
   },
 };
@@ -420,15 +708,32 @@ async function handle(message) {
   if (method === "ping") return { jsonrpc: "2.0", id, result: {} };
 
   if (method === "tools/list") {
-    return { jsonrpc: "2.0", id, result: { tools: [TOOL] } };
+    return { jsonrpc: "2.0", id, result: { tools: [TOOL, DOCUMENTS_TOOL, DELETE_TOOL] } };
   }
 
   if (method === "tools/call") {
-    if (params?.name !== TOOL_NAME) {
+    const tool = params?.name;
+    if (tool !== TOOL_NAME && tool !== DOCUMENTS_TOOL.name && tool !== DELETE_TOOL.name) {
       return {
         jsonrpc: "2.0",
         id,
-        error: { code: -32602, message: `unknown tool: ${String(params?.name)}` },
+        error: { code: -32602, message: `unknown tool: ${String(tool)}` },
+      };
+    }
+
+    if (tool === DOCUMENTS_TOOL.name) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: await documentsResult(params?.arguments?.query),
+      };
+    }
+
+    if (tool === DELETE_TOOL.name) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: await deleteResult(params?.arguments?.doc_id),
       };
     }
 
@@ -439,18 +744,27 @@ async function handle(message) {
     const rawK = params?.arguments?.k;
     const k = Number.isInteger(rawK) ? rawK : DEFAULT_K;
 
+    const scoped = await scopeFor(params?.arguments);
+    if (scoped.error !== undefined) {
+      return { jsonrpc: "2.0", id, result: textResult(scoped.error, true) };
+    }
+
     // The check was started at startup and has at most three seconds to answer,
     // so this costs the first call the *difference* between the two waits rather
     // than their sum. It is also the only place the notice can be delivered: stderr
     // goes to a log nobody reads, and a harness shows the model the tool result.
-    const [outcome, latest] = await Promise.all([search(query, k), updateCheck]);
+    const [outcome, latest] = await Promise.all([search(query, k, scoped.scope), updateCheck]);
     const text = outcome.ok ? format(outcome.results, outcome.retrieval_ms) : outcome.message;
     const notice = updateNotice(latest);
+    // The scope line is appended to a *successful* answer only: on a failure the
+    // message already says what went wrong, and "scope: documents" beside "nothing
+    // retrieved" reads as if the scope were the reason.
+    const body = [text, outcome.ok ? scoped.note : undefined, notice].filter(Boolean).join("\n\n");
 
     return {
       jsonrpc: "2.0",
       id,
-      result: textResult(notice === undefined ? text : `${text}\n\n${notice}`, !outcome.ok),
+      result: textResult(body, !outcome.ok),
     };
   }
 
