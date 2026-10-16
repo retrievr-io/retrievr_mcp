@@ -43,7 +43,7 @@ const SERVER_NAME = "retrievr";
  * it, and the release tag is cut from it. It is also why there is no second
  * version string in here to drift away from the first.
  */
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 
 /**
  * The deployment, unless told otherwise.

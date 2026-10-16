@@ -45,7 +45,7 @@ GitHub is unreachable, rate-limited or private, the check says nothing at all.
 
 To update, re-run the install line — the connect step also refreshes this file.
 
-The version of this copy is **0.1.0**.
+The version of this copy is **0.1.1**.
 
 ## The key
 

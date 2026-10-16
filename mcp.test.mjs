@@ -26,6 +26,17 @@ import assert from "node:assert/strict";
 
 const SERVER = resolve(import.meta.dirname, "mcp.mjs");
 
+/**
+ * The version the server reports, read out of the server rather than written here.
+ *
+ * A hardcoded copy is how these tests go quietly vacuous: bump the release and the
+ * "stays quiet when this copy is the latest" case starts passing because the copy is
+ * now *newer* than the feed, which asserts nothing. Read this way, a bump moves the
+ * tests with it — the same extraction the sync script does before it publishes.
+ */
+const VERSION = /^const VERSION = "(.+)";$/m.exec(readFileSync(SERVER, "utf8"))?.[1];
+assert.equal(typeof VERSION, "string", "mcp.mjs has no VERSION to test against");
+
 const RESULT = {
   chunk_id: "158678",
   text: "  When in the Course of human events, it becomes necessary for one people to dissolve\n  the political bands which have connected them with another.  ",
@@ -508,7 +519,7 @@ async function startReleaseFeed({ mode = "newer" } = {}) {
     }
     // "unreadable" is a tag that is not a version — a nightly, say. A tag nobody
     // can compare is a tag to say nothing about.
-    const tag_name = mode === "newer" ? "v0.2.0" : mode === "current" ? "v0.1.0" : "nightly";
+    const tag_name = mode === "newer" ? "v0.2.0" : mode === "current" ? `v${VERSION}` : "nightly";
     return response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ tag_name }));
   });
 
@@ -560,7 +571,9 @@ describe("the update check", async () => {
       // The line names both versions, because "update available" without them is
       // something a reader cannot act on or check.
       assert.match(first, /0\.2\.0 is available/);
-      assert.match(first, /0\.1\.0/);
+      // And names the copy it is talking about, which is the only way the human
+      // knows which of their machines is behind.
+      assert.ok(first.includes(VERSION), "the notice does not name this copy's version");
       // And the answer is still the answer.
       assert.match(first, /Declaration of Independence/);
 
