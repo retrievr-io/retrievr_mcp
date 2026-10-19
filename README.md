@@ -95,8 +95,8 @@ the whole interface:
   same thing.
 - "Search the public corpus for ..."
   → `scope: "public"`.
-- "In adaptive-harness-proposal.pdf, what does it say about budgets?"
-  → `documents: ["adaptive-harness-proposal.pdf"]`. Call `retrievr_documents`
+- "In the project proposal, what does it say about budgets?"
+  → `documents: ["project-proposal.pdf"]`. Call `retrievr_documents`
   first when the exact name is not known.
 - "Which of my documents mentions X?"
   → `scope: "private"`, then say which document each passage came from.

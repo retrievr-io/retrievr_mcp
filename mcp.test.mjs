@@ -56,8 +56,8 @@ const RESULT = {
 /** A document in the caller's own library, as `GET /documents` answers it. */
 const LIBRARY_DOCUMENT = {
   id: "lib:22a615eb-e7ae-4ef4-9d9a-baecbf720dae",
-  title: "adaptive-harness-proposal.pdf",
-  filename: "adaptive-harness-proposal.pdf",
+  title: "project-proposal.pdf",
+  filename: "project-proposal.pdf",
   source: "library",
   passages: 12,
 };
@@ -89,7 +89,7 @@ async function startUpstream() {
     matches: {
       "Tarzan of the Apes": [PUBLIC_DOCUMENT],
       tarzan: [PUBLIC_DOCUMENT],
-      "adaptive-harness-proposal.pdf": [LIBRARY_DOCUMENT],
+      "project-proposal.pdf": [LIBRARY_DOCUMENT],
     },
   };
 
@@ -441,7 +441,7 @@ describe("the retrievr MCP server", async () => {
     assert.equal(answer.result.isError, true);
     assert.match(textOf(answer), /the lease/);
     // And what they do have, so the model recovers without a second guess.
-    assert.match(textOf(answer), /adaptive-harness-proposal/);
+    assert.match(textOf(answer), /project-proposal/);
     // The whole point: a name that resolved to nothing did not become a search of
     // everything.
     assert.equal(upstream.state.submitted, before);
@@ -452,7 +452,7 @@ describe("the retrievr MCP server", async () => {
       name: "retrievr_documents",
       arguments: {},
     });
-    assert.match(textOf(listed), /adaptive-harness-proposal\.pdf/);
+    assert.match(textOf(listed), /project-proposal\.pdf/);
     assert.match(textOf(listed), /lib:22a615eb/);
     assert.equal(upstream.state.documentQueries.at(-1), "");
 
