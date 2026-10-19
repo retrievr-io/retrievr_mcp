@@ -4,13 +4,15 @@ The MCP server for [retrievr](https://retrievr.io): search openly licensed
 documents and your own library, and get passages back with their citation —
 source, author, section, character range and licence.
 
-It holds three tools:
+It holds five tools:
 
 | tool | what it does |
 |---|---|
 | `retrievr_search` | a question in, cited passages out |
 | `retrievr_documents` | lists your library, or finds a document by name |
 | `retrievr_delete_document` | permanently removes one of your uploads |
+| `retrievr_upload` | adds files from your machine to your library |
+| `retrievr_upload_status` | says which uploads are ready, and which failed and why |
 
 This runs on **your** machine, beside your agent, and holds no corpus of its own.
 It reads your retrievr key and talks to retrievr's API. That is the whole of it.
@@ -53,7 +55,7 @@ GitHub is unreachable, rate-limited or private, the check says nothing at all.
 
 To update, re-run the install line — the connect step also refreshes this file.
 
-The version of this copy is **0.1.1**.
+The version of this copy is **0.2.0**.
 
 ## Search settings
 
@@ -103,6 +105,26 @@ the whole interface:
 - "Delete the thesis draft."
   → `retrievr_delete_document`, only after `retrievr_documents` and reading the
   exact title back to the user. There is no undo and no trash.
+- "Upload my lease — it's at ~/Documents/lease.pdf."
+  → `retrievr_upload` with `paths: ["/Users/you/Documents/lease.pdf"]`, then
+  `retrievr_upload_status` with the upload id it returns.
+
+## Uploading
+
+`retrievr_upload` takes a list of local paths and puts those files in the user's
+library. This server reads the files itself and sends them to retrievr, so a
+document's contents never pass through the agent's context — what comes back is
+an upload id and a sentence.
+
+PDF, EPUB, plain text and Markdown, up to 50 MB each and 20 files in one call;
+the library holds 20 documents. Uploading is free, but it is enabled only once
+the account has been funded.
+
+Embedding is asynchronous. `retrievr_upload_status` takes the upload id and says
+what became of each file. A file that could not be read was not added and holds
+no place in the library, so it can be sent again.
+
+Nothing is uploaded unless the user named the file.
 
 ## What comes back
 

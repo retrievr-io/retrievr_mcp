@@ -19,7 +19,7 @@
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -36,6 +36,20 @@ const SERVER = resolve(import.meta.dirname, "mcp.mjs");
  */
 const VERSION = /^const VERSION = "(.+)";$/m.exec(readFileSync(SERVER, "utf8"))?.[1];
 assert.equal(typeof VERSION, "string", "mcp.mjs has no VERSION to test against");
+
+/**
+ * A release newer than this copy, derived rather than written down.
+ *
+ * These tests are about the check noticing a newer release; a hardcoded version
+ * stops asserting that the moment the copy is bumped past it (0.2.0 is not newer
+ * than a 0.2.0 copy, and the "newer" case would pass while proving the opposite).
+ * Derived, a bump moves the tests with it.
+ */
+const NEWER_VERSION = (() => {
+  const parts = VERSION.split(".").map(Number);
+  parts[2] += 1;
+  return parts.join(".");
+})();
 
 const RESULT = {
   chunk_id: "158678",
@@ -85,6 +99,14 @@ async function startUpstream() {
     // Deletions the stub was asked for, and whether the id it was given is one it
     // knows. A `404` here stands in for both "no such document" and "not yours".
     deleted: [],
+    // Uploads: what the stub was asked to start, the bytes it received, what it was
+    // asked to commit, and the jobs a status call reports. `uploadMode` is how a
+    // test makes the init refuse.
+    uploadStarted: [],
+    uploadedBytes: [],
+    uploadCommitted: [],
+    uploadMode: "ok",
+    jobs: [],
     library: [LIBRARY_DOCUMENT],
     matches: {
       "Tarzan of the Apes": [PUBLIC_DOCUMENT],
@@ -100,6 +122,15 @@ async function startUpstream() {
         text += chunk;
       });
       request.on("end", () => done(text));
+    });
+
+  // Bytes, not text: the point of the upload path is that the file arrives whole,
+  // and decoding it as a string would hide a truncated or re-encoded body.
+  const readBytes = (request) =>
+    new Promise((done) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(chunk));
+      request.on("end", () => done(Buffer.concat(chunks)));
     });
 
   const server = createServer(async (request, response) => {
@@ -122,6 +153,73 @@ async function startUpstream() {
         retrieval_ms: 123,
       });
     }
+    // The upload door: init (POST the collection), commit (POST the upload id), and
+    // the agent's status call (GET, one upload or the recent ones). The signed URLs
+    // point back at this stub, so a PUT is observable here.
+    if (request.url.startsWith("/library-upload")) {
+      const url = new URL(request.url, "http://upstream");
+      const tail = url.pathname.split("/").filter(Boolean).pop() ?? "";
+
+      if (request.method === "GET") {
+        const uploadId = url.searchParams.get("upload_id") ?? "";
+        const jobs = state.jobs.filter(
+          (job) => uploadId === "" || job.upload_id === uploadId,
+        );
+        return send(200, { upload_id: uploadId === "" ? null : uploadId, jobs });
+      }
+
+      if (request.method !== "POST") return send(405, { error: "method_not_allowed" });
+      const body = JSON.parse(await readBody(request));
+
+      if (tail !== "library-upload") {
+        state.uploadCommitted.push(body);
+        return send(202, {
+          upload_id: tail,
+          jobs: body.files.map((file, index) => ({ id: `job-${index}`, filename: file.filename })),
+        });
+      }
+
+      state.uploadStarted.push(body);
+      if (state.uploadMode === "not_funded") {
+        return send(403, {
+          error: "uploads_not_enabled",
+          message:
+            "Uploads are enabled once the account has been funded. Add $10 of credit at " +
+            "https://retrievr.io/profile.",
+        });
+      }
+      if (state.uploadMode === "unsupported") {
+        return send(415, {
+          error: "unsupported_type",
+          message: `${body.files[0].filename} cannot be read. Accepted: PDF, EPUB, plain text and Markdown.`,
+        });
+      }
+
+      const uploadId = "upload-1";
+      const origin = `http://127.0.0.1:${server.address().port}`;
+      return send(202, {
+        upload_id: uploadId,
+        bucket: "library",
+        uploads: body.files.map((file, index) => ({
+          filename: file.filename,
+          path: `tenant/${uploadId}/${index}-${file.filename}`,
+          content_type: "text/markdown",
+          url: `${origin}/storage/${uploadId}/${index}`,
+        })),
+      });
+    }
+
+    if (request.method === "PUT" && request.url.startsWith("/storage/")) {
+      const bytes = await readBytes(request);
+      state.uploadedBytes.push({
+        url: request.url,
+        bytes: bytes.length,
+        text: bytes.toString("utf8"),
+        contentType: request.headers["content-type"],
+      });
+      return send(200, {});
+    }
+
     // The naming route: no `q` is the whole library, `q` is a lookup across the
     // caller's library and the public corpus. A path id is a deletion.
     if (request.url.startsWith("/documents")) {
@@ -259,12 +357,18 @@ describe("the retrievr MCP server", async () => {
     assert.equal(typeof answer.result.capabilities.tools, "object");
   });
 
-  it("offers the search tool and the naming tool", async () => {
+  it("offers every tool, with the arguments a model needs to see", async () => {
     const answer = await withKey.request("tools/list", {});
     const tools = answer.result.tools;
     assert.deepEqual(
       tools.map((tool) => tool.name),
-      ["retrievr_search", "retrievr_documents", "retrievr_delete_document"],
+      [
+        "retrievr_search",
+        "retrievr_documents",
+        "retrievr_delete_document",
+        "retrievr_upload",
+        "retrievr_upload_status",
+      ],
     );
     const search = tools[0];
     assert.equal(search.inputSchema.required.includes("query"), true);
@@ -273,6 +377,12 @@ describe("the retrievr MCP server", async () => {
     // has to offer it — a model cannot ask for a scope it cannot see.
     assert.deepEqual(search.inputSchema.properties.scope.enum, ["all", "public", "private"]);
     assert.equal(search.inputSchema.properties.documents.type, "array");
+    // Uploading is paths, not file contents: the bytes are this process's job, and
+    // a schema that asked for them would be asking the model to carry the file.
+    const upload = tools.find((tool) => tool.name === "retrievr_upload");
+    assert.deepEqual(upload.inputSchema.required, ["paths"]);
+    assert.equal(upload.inputSchema.properties.paths.type, "array");
+    assert.equal(upload.inputSchema.properties.paths.items.type, "string");
   });
 
   it("answers a query with cited passages", async () => {
@@ -503,6 +613,159 @@ describe("the retrievr MCP server", async () => {
     assert.match(textOf(answer), /doc_id is required/i);
     assert.equal(upstream.state.deleted.length, before);
   });
+
+  // --- uploading a document -------------------------------------------------
+
+  /** A real file on disk, because the tool reads paths rather than bytes from the caller. */
+  function tempFile(name, text) {
+    const dir = mkdtempSync(join(tmpdir(), "retrievr-upload-"));
+    const path = join(dir, name);
+    writeFileSync(path, text);
+    return path;
+  }
+
+  it("uploads a file the user named, and the bytes never enter the conversation", async () => {
+    const body = "# The notice period\n\nIt is thirty days.\n";
+    const path = tempFile("notes.md", body);
+
+    const answer = await withKey.request("tools/call", {
+      name: "retrievr_upload",
+      arguments: { paths: [path] },
+    });
+    const text = textOf(answer);
+
+    assert.notEqual(answer.result.isError, true);
+    assert.match(text, /Embedding has started/);
+    assert.match(text, /upload-1/);
+    // The model gets a filename and an id — not the file. A tool that echoed the
+    // document back would have put it in the context it is meant to keep it out of.
+    assert.match(text, /notes\.md/);
+    assert.doesNotMatch(text, /thirty days/);
+
+    // The three steps, in the server's order: names and sizes, the bytes, the commit.
+    assert.deepEqual(upstream.state.uploadStarted.at(-1), {
+      files: [{ filename: "notes.md", byte_size: Buffer.byteLength(body) }],
+    });
+    assert.equal(upstream.state.uploadedBytes.at(-1).text, body);
+    assert.equal(upstream.state.uploadedBytes.at(-1).contentType, "text/markdown");
+    assert.deepEqual(upstream.state.uploadCommitted.at(-1), {
+      files: [{ filename: "notes.md", path: "tenant/upload-1/0-notes.md" }],
+    });
+  });
+
+  it("refuses a path that is not a file before it calls the service", async () => {
+    const before = upstream.state.uploadStarted.length;
+    const answer = await withKey.request("tools/call", {
+      name: "retrievr_upload",
+      arguments: { paths: [join(tmpdir(), "no-such-retrievr-file.pdf")] },
+    });
+    assert.equal(answer.result.isError, true);
+    assert.match(textOf(answer), /could not read/i);
+    // Nothing was asked to start, so a typo cannot leave an empty upload behind.
+    assert.equal(upstream.state.uploadStarted.length, before);
+
+    // A model writes `~/...`; there is no shell here, so the tool expands it. The
+    // message names the path it actually looked for, which is how the model learns
+    // whether the file is missing or the path was never resolved.
+    const tilde = await withKey.request("tools/call", {
+      name: "retrievr_upload",
+      arguments: { paths: ["~/no-such-retrievr-file.pdf"] },
+    });
+    assert.equal(tilde.result.isError, true);
+    assert.ok(textOf(tilde).includes(homedir()), "~/ was not expanded to the home directory");
+    assert.equal(upstream.state.uploadStarted.length, before);
+  });
+
+  it("reads back the server's refusal rather than rewording it", async () => {
+    const path = tempFile("contract.pdf", "%PDF-1.4\n");
+    const before = upstream.state.uploadedBytes.length;
+    upstream.state.uploadMode = "not_funded";
+    try {
+      const answer = await withKey.request("tools/call", {
+        name: "retrievr_upload",
+        arguments: { paths: [path] },
+      });
+      assert.equal(answer.result.isError, true);
+      // The sentence names what to do and where, which is what an agent has to relay.
+      assert.match(textOf(answer), /funded/i);
+      assert.match(textOf(answer), /retrievr\.io\/profile/);
+      // Refused at the init means no bytes were read or sent.
+      assert.equal(upstream.state.uploadedBytes.length, before);
+    } finally {
+      upstream.state.uploadMode = "ok";
+    }
+  });
+
+  it("says where to get a key before it tries to upload", async () => {
+    const bare = startClient({ url: upstream.url, key: "", configDir: emptyConfig });
+    const path = tempFile("notes.md", "hello");
+    try {
+      const answer = await bare.request("tools/call", {
+        name: "retrievr_upload",
+        arguments: { paths: [path] },
+      });
+      assert.equal(answer.error, undefined);
+      assert.equal(answer.result.isError, true);
+      assert.match(textOf(answer), /connect|credentials|key/i);
+      assert.match(textOf(answer), /nothing was sent/i);
+    } finally {
+      bare.close();
+    }
+  });
+
+  it("says what became of an upload, naming the ones that failed", async () => {
+    upstream.state.jobs = [
+      {
+        id: "job-a",
+        upload_id: "upload-1",
+        filename: "notes.md",
+        status: "ready",
+        error_code: null,
+        error: null,
+      },
+      {
+        id: "job-b",
+        upload_id: "upload-1",
+        filename: "scan.pdf",
+        status: "failed",
+        error_code: "no_text",
+        error: "scan.pdf contains no extractable text. If it is a scan or images, there is nothing to embed.",
+      },
+      {
+        id: "job-c",
+        upload_id: "upload-1",
+        filename: "lease.pdf",
+        status: "embedding",
+        error_code: null,
+        error: null,
+      },
+    ];
+    try {
+      const answer = await withKey.request("tools/call", {
+        name: "retrievr_upload_status",
+        arguments: { upload_id: "upload-1" },
+      });
+      const text = textOf(answer);
+      assert.notEqual(answer.result.isError, true);
+      // How many settled, how many are still going, and which one needs a human.
+      assert.match(text, /2 of 3 settled/);
+      assert.match(text, /1 still embedding/);
+      assert.match(text, /scan\.pdf: .*no extractable text/i);
+      // A failed file holds no place, which is the fact that decides the retry.
+      assert.match(text, /can be sent again/i);
+    } finally {
+      upstream.state.jobs = [];
+    }
+  });
+
+  it("tells the agent nothing has been uploaded rather than inventing a status", async () => {
+    const answer = await withKey.request("tools/call", {
+      name: "retrievr_upload_status",
+      arguments: {},
+    });
+    assert.notEqual(answer.result.isError, true);
+    assert.match(textOf(answer), /not uploaded anything/i);
+  });
 });
 
 /** A stub of GitHub's latest-release endpoint, counting how often it is asked. */
@@ -519,7 +782,7 @@ async function startReleaseFeed({ mode = "newer" } = {}) {
     }
     // "unreadable" is a tag that is not a version — a nightly, say. A tag nobody
     // can compare is a tag to say nothing about.
-    const tag_name = mode === "newer" ? "v0.2.0" : mode === "current" ? `v${VERSION}` : "nightly";
+    const tag_name = mode === "newer" ? `v${NEWER_VERSION}` : mode === "current" ? `v${VERSION}` : "nightly";
     return response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ tag_name }));
   });
 
@@ -570,7 +833,7 @@ describe("the update check", async () => {
       const first = await search(client, "a question");
       // The line names both versions, because "update available" without them is
       // something a reader cannot act on or check.
-      assert.match(first, /0\.2\.0 is available/);
+      assert.match(first, new RegExp(`${NEWER_VERSION.replaceAll(".", "\\.")} is available`));
       // And names the copy it is talking about, which is the only way the human
       // knows which of their machines is behind.
       assert.ok(first.includes(VERSION), "the notice does not name this copy's version");
@@ -595,14 +858,14 @@ describe("the update check", async () => {
     const dir = mkdtempSync(join(tmpdir(), "retrievr-cache-"));
     writeFileSync(
       join(dir, "update-check.json"),
-      JSON.stringify({ checkedAt: Date.now(), latest: "0.2.0" }),
+      JSON.stringify({ checkedAt: Date.now(), latest: NEWER_VERSION }),
     );
 
     const feed = await startReleaseFeed({ mode: "newer" });
     const client = await clientOn(feed, dir);
     try {
       const text = await search(client, "a question");
-      assert.match(text, /0\.2\.0 is available/);
+      assert.match(text, new RegExp(`${NEWER_VERSION.replaceAll(".", "\\.")} is available`));
       assert.equal(feed.state.asks, 0, "a fresh cache means GitHub is not asked");
     } finally {
       client.close();
@@ -617,7 +880,7 @@ describe("the update check", async () => {
     try {
       await search(client, "a question");
       const written = JSON.parse(readFileSync(join(dir, "update-check.json"), "utf8"));
-      assert.equal(written.latest, "0.2.0");
+      assert.equal(written.latest, NEWER_VERSION);
       assert.equal(typeof written.checkedAt, "number");
     } finally {
       client.close();

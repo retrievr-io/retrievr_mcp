@@ -23,9 +23,9 @@
 //     which is a programming error in the caller.
 //
 // stdout is the protocol channel. Anything that is not JSON-RPC goes to stderr.
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { createInterface } from "node:readline";
 
 /** What this server speaks. The client's own choice is echoed when we know it. */
@@ -43,7 +43,7 @@ const SERVER_NAME = "retrievr";
  * it, and the release tag is cut from it. It is also why there is no second
  * version string in here to drift away from the first.
  */
-const VERSION = "0.1.1";
+const VERSION = "0.2.0";
 
 /**
  * The deployment, unless told otherwise.
@@ -111,6 +111,20 @@ const SCOPES = ["all", "public", "private"];
 /** How many documents one call may name. The API's own ceiling on `scope.ids` is 100. */
 const MAX_DOCUMENT_NAMES = 20;
 
+/**
+ * The library's own limits, repeated here for one reason each.
+ *
+ * The server decides what may be uploaded — the gate, the type, the archive rule,
+ * the cap — and these are not a second opinion on any of that. They exist because a
+ * file has to be read from this machine *before* the server can refuse it wrongly
+ * sized, and reading twenty-one files or a gigabyte to be told no is a cost paid
+ * before the sentence arrives. The type and the archive are deliberately absent:
+ * the init is one small request, so the server's message about a `.docx` reaches
+ * the model without this file growing a copy of the extractor's allowlist.
+ */
+const MAX_DOCUMENT_BYTES = 50 * 1024 * 1024;
+const MAX_FILES_PER_DROP = 20;
+
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 function baseUrl() {
@@ -141,7 +155,7 @@ function apiKey() {
 
 /** The sentence a machine with no key needs, which is how to get one. */
 const NO_KEY = [
-  "No retrievr key on this machine yet, so nothing was retrieved.",
+  "No retrievr key on this machine yet, so nothing was sent.",
   "Run the connect step from https://retrievr.io/install: it writes the key to",
   "~/.config/retrievr/credentials and never prints it. This tool will work on the",
   "next call — it reads the key each time and does not need restarting.",
@@ -591,6 +605,308 @@ async function deleteResult(rawId) {
   );
 }
 
+// --- putting a file in --------------------------------------------------------
+
+/** Bytes as a person says them, matching the server's own sentence. */
+function megabytes(bytes) {
+  return (bytes / 1024 / 1024).toFixed(1);
+}
+
+/**
+ * The local half of a drop: the paths exist, are files, are small enough to read,
+ * and there are not too many.
+ *
+ * Everything else — the gate, the type, the archive rule, the cap — is the
+ * server's, because those are the library's rules and a second copy here would be
+ * a second answer. This runs before a byte is read, so a refusal is cheap.
+ */
+function localPlan(paths) {
+  if (!Array.isArray(paths) || paths.length === 0) {
+    return { error: "retrievr: paths must be a non-empty list of local file paths." };
+  }
+  if (paths.length > MAX_FILES_PER_DROP) {
+    return {
+      error: `retrievr: a drop carries at most ${MAX_FILES_PER_DROP} files. Nothing was uploaded.`,
+    };
+  }
+
+  const files = [];
+  for (const entry of paths) {
+    const named = typeof entry === "string" ? entry.trim() : "";
+    if (named === "") {
+      return { error: "retrievr: every path must be a non-empty string." };
+    }
+    // A model writes `~/lease.pdf` because that is how a person says it, and there
+    // is no shell here to expand it.
+    const path = named.startsWith("~/") ? join(homedir(), named.slice(2)) : named;
+
+    let stats;
+    try {
+      stats = statSync(path);
+    } catch (cause) {
+      return {
+        error:
+          `retrievr: could not read ${path} (${cause.code ?? cause.message}). ` +
+          "Pass a path that exists on this machine and that you can read, as the user named it.",
+      };
+    }
+    if (!stats.isFile()) {
+      return { error: `retrievr: ${path} is not a file.` };
+    }
+    if (stats.size > MAX_DOCUMENT_BYTES) {
+      return {
+        error: `retrievr: ${basename(path)} is ${megabytes(stats.size)} MB. The limit is 50 MB.`,
+      };
+    }
+    files.push({ path, filename: basename(path), bytes: stats.size });
+  }
+
+  return { files };
+}
+
+/**
+ * The server's sentence for a refusal, or the status read as best we can.
+ *
+ * Every refusal in the library flow carries a `message` written for the person who
+ * caused it, and the agent's job is to read it back rather than reword it. The
+ * fallback exists for the day a response has a code and no sentence.
+ */
+async function refusalMessage(response) {
+  const body = await response.json().catch(() => ({}));
+  return typeof body?.message === "string" && body.message !== ""
+    ? body.message
+    : explain(response.status, typeof body?.error === "string" ? body.error : "");
+}
+
+/**
+ * `retrievr_upload`: read files from this machine and put them in the library.
+ *
+ * The bytes never cross the tool boundary. The model names paths, this process
+ * reads the files and sends them to Storage on the signed URLs the init minted, and
+ * what comes back is an upload id and a sentence — which is the whole reason this
+ * is a tool and not the two raw HTTP calls, in the same way the search pair is.
+ *
+ * One call is one drop, so the server's all-or-nothing rule applies to every file
+ * in it: if one is refused at the init, none of them is sent.
+ */
+async function uploadResult(rawPaths) {
+  const key = apiKey();
+  if (key === undefined) return textResult(NO_KEY, true);
+
+  const planned = localPlan(rawPaths);
+  if (planned.error !== undefined) return textResult(planned.error, true);
+
+  const headers = { "content-type": "application/json", authorization: `Bearer ${key}` };
+
+  let initResponse;
+  try {
+    initResponse = await fetch(`${baseUrl()}/library-upload`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        files: planned.files.map((file) => ({ filename: file.filename, byte_size: file.bytes })),
+      }),
+    });
+  } catch (cause) {
+    return textResult(`retrievr: could not reach the service (${cause.message}).`, true);
+  }
+
+  if (initResponse.status !== 202) {
+    return textResult(await refusalMessage(initResponse), true);
+  }
+
+  const init = await initResponse.json().catch(() => null);
+  if (
+    init === null ||
+    typeof init.upload_id !== "string" ||
+    !Array.isArray(init.uploads) ||
+    init.uploads.length !== planned.files.length
+  ) {
+    return textResult(
+      "retrievr: the service did not answer with somewhere to put the files. Nothing was uploaded.",
+      true,
+    );
+  }
+
+  // The init lists the files in the order they were sent (`planDrop` keeps it), so
+  // an index pairs a signed URL with the path it was minted for.
+  for (const [index, target] of init.uploads.entries()) {
+    const file = planned.files[index];
+
+    let bytes;
+    try {
+      bytes = readFileSync(file.path);
+    } catch (cause) {
+      return textResult(
+        `retrievr: could not read ${file.filename} (${cause.message}). Nothing was uploaded.`,
+        true,
+      );
+    }
+
+    let sent;
+    try {
+      sent = await fetch(target.url, {
+        method: "PUT",
+        headers: { "content-type": target.content_type, "x-upsert": "false" },
+        body: bytes,
+      });
+    } catch (cause) {
+      return textResult(
+        `retrievr: ${file.filename} could not be sent (${cause.message}). Nothing was added.`,
+        true,
+      );
+    }
+    if (!sent.ok) {
+      return textResult(
+        `retrievr: ${file.filename} could not be sent (storage answered ${sent.status}). Nothing was added.`,
+        true,
+      );
+    }
+  }
+
+  let commitResponse;
+  try {
+    commitResponse = await fetch(`${baseUrl()}/library-upload/${init.upload_id}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        files: init.uploads.map((upload) => ({ filename: upload.filename, path: upload.path })),
+      }),
+    });
+  } catch (cause) {
+    return textResult(`retrievr: lost the service before the upload finished (${cause.message}).`, true);
+  }
+
+  if (commitResponse.status !== 202) {
+    return textResult(await refusalMessage(commitResponse), true);
+  }
+  // The body names the jobs the commit made; the model needs the upload id, not one
+  // id per file, so it is read and dropped rather than forwarded.
+  await commitResponse.body?.cancel();
+
+  const files = planned.files.map((file) => `  ${file.filename}`);
+  return textResult(
+    [
+      `Sent ${planned.files.length} file${planned.files.length === 1 ? "" : "s"} to retrievr. ` +
+        "Embedding has started — they are not searchable until it finishes.",
+      ...files,
+      "",
+      `Upload id: ${init.upload_id}`,
+      "Call retrievr_upload_status with that upload_id to see when they are ready " +
+        "(a large PDF can take a few minutes). Until then retrievr_documents shows " +
+        "them as not retrievable yet.",
+    ].join("\n"),
+  );
+}
+
+/**
+ * The sentence for a failed job, from the row the worker wrote.
+ *
+ * The worker's own `error` is the better text and is preferred. `error_code` is the
+ * fallback for a row that failed before it could say why, and a code still tells the
+ * model more than "failed" does.
+ */
+function failureOf(job) {
+  const reason = typeof job.error === "string" && job.error !== ""
+    ? job.error
+    : typeof job.error_code === "string" && job.error_code !== ""
+      ? job.error_code
+      : "no reason was recorded";
+  return `${job.filename}: ${reason}`;
+}
+
+/**
+ * One drop, as an agent reads it: how much is done, and what failed and why.
+ *
+ * A success is one line and a failure is named, which is the bell's rule (§8.3) in
+ * text: the thing that needs action must not be buried under the twenty that
+ * worked.
+ */
+function uploadGroupText(uploadId, jobs) {
+  const ready = jobs.filter((job) => job.status === "ready").length;
+  const failed = jobs.filter((job) => job.status === "failed").length;
+  const pending = jobs.length - ready - failed;
+
+  const headline =
+    pending > 0
+      ? `${ready + failed} of ${jobs.length} settled; ${pending} still embedding.`
+      : failed > 0
+        ? ready === 0
+          ? `All ${failed} file${failed === 1 ? "" : "s"} failed — nothing was added.`
+          : `${failed} of ${jobs.length} files failed; ${ready} ready.`
+        : `All ${ready} document${ready === 1 ? "" : "s"} ready and searchable.`;
+
+  const lines = [`Upload ${uploadId}: ${headline}`];
+  for (const job of jobs) {
+    if (job.status === "failed") lines.push(`  - ${failureOf(job)}`);
+  }
+  if (failed > 0) {
+    lines.push(
+      "Failed files were not added and hold no place in the library, so they can be sent again.",
+    );
+  }
+  if (pending > 0) {
+    lines.push("Call this tool again in a minute to see the rest.");
+  }
+  return lines.join("\n");
+}
+
+/**
+ * `retrievr_upload_status`: what became of an upload.
+ *
+ * The upload id is the drop's; with no id this answers for the tenant's most recent
+ * jobs, because an agent that has lost the id can still find out what happened. The
+ * grouping is by upload, newest first — one drop is one answer, not one per file.
+ */
+async function uploadStatusResult(rawUploadId) {
+  const key = apiKey();
+  if (key === undefined) return textResult(NO_KEY, true);
+
+  const uploadId = typeof rawUploadId === "string" ? rawUploadId.trim() : "";
+  const query = uploadId === "" ? "" : `?upload_id=${encodeURIComponent(uploadId)}`;
+
+  let response;
+  try {
+    response = await fetch(`${baseUrl()}/library-upload${query}`, {
+      headers: { authorization: `Bearer ${key}` },
+    });
+  } catch (cause) {
+    return textResult(`retrievr: could not reach the service (${cause.message}).`, true);
+  }
+
+  if (response.status === 404) {
+    return textResult(
+      `retrievr: no upload of the user's has the id ${uploadId}. ` +
+        "Call this tool with no argument to see their recent uploads.",
+      true,
+    );
+  }
+  if (!response.ok) {
+    return textResult(await refusalMessage(response), true);
+  }
+
+  const body = await response.json().catch(() => ({}));
+  const jobs = Array.isArray(body?.jobs) ? body.jobs : [];
+  if (jobs.length === 0) {
+    return textResult(
+      uploadId === ""
+        ? "The user has not uploaded anything to retrievr yet. Call retrievr_upload with the paths they named."
+        : `No jobs were recorded for upload ${uploadId}.`,
+    );
+  }
+
+  const groups = new Map();
+  for (const job of jobs) {
+    const group = groups.get(job.upload_id) ?? [];
+    group.push(job);
+    groups.set(job.upload_id, group);
+  }
+
+  return textResult(
+    [...groups.entries()].map(([id, group]) => uploadGroupText(id, group)).join("\n\n"),
+  );
+}
+
 function textResult(text, isError = false) {
   return { content: [{ type: "text", text }], isError };
 }
@@ -687,6 +1003,55 @@ const DELETE_TOOL = {
   },
 };
 
+const UPLOAD_TOOL = {
+  name: "retrievr_upload",
+  title: "Upload documents to retrievr",
+  description:
+    "Add the user's own files to their private retrievr library, where their searches can find " +
+    "them with citations. Pass the local paths of files the user named. This server reads each " +
+    "file and sends it straight to retrievr, so its contents never pass through the conversation. " +
+    "Accepts PDF, EPUB, plain text and Markdown, up to 50 MB each and 20 files in one call; the " +
+    "library holds 20 documents. Uploading is free, but only enabled once the account has been " +
+    "funded. Embedding is asynchronous: this returns an upload id, and retrievr_upload_status says " +
+    "when the documents are ready to search. Never upload a file the user did not ask for.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      paths: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "Local paths of the files to upload, as the user named them. A leading ~/ is " +
+          "expanded. One call is one drop: if any file is refused, none of them is added.",
+      },
+    },
+    required: ["paths"],
+    additionalProperties: false,
+  },
+};
+
+const UPLOAD_STATUS_TOOL = {
+  name: "retrievr_upload_status",
+  title: "Check a retrievr upload",
+  description:
+    "Check what happened to files uploaded with retrievr_upload: how many are ready to search, how " +
+    "many are still embedding, and which failed and why. Call it with the upload_id retrievr_upload " +
+    "returned, or with no argument to see the user's most recent uploads. A failed file was not " +
+    "added and holds no place in the library, so it can be sent again.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      upload_id: {
+        type: "string",
+        description:
+          "The upload id retrievr_upload returned. Omit it to see the user's most recent uploads.",
+      },
+    },
+    required: [],
+    additionalProperties: false,
+  },
+};
+
 async function handle(message) {
   const { id, method, params } = message;
 
@@ -708,16 +1073,43 @@ async function handle(message) {
   if (method === "ping") return { jsonrpc: "2.0", id, result: {} };
 
   if (method === "tools/list") {
-    return { jsonrpc: "2.0", id, result: { tools: [TOOL, DOCUMENTS_TOOL, DELETE_TOOL] } };
+    return {
+      jsonrpc: "2.0",
+      id,
+      result: { tools: [TOOL, DOCUMENTS_TOOL, DELETE_TOOL, UPLOAD_TOOL, UPLOAD_STATUS_TOOL] },
+    };
   }
 
   if (method === "tools/call") {
     const tool = params?.name;
-    if (tool !== TOOL_NAME && tool !== DOCUMENTS_TOOL.name && tool !== DELETE_TOOL.name) {
+    const known = [
+      TOOL_NAME,
+      DOCUMENTS_TOOL.name,
+      DELETE_TOOL.name,
+      UPLOAD_TOOL.name,
+      UPLOAD_STATUS_TOOL.name,
+    ];
+    if (!known.includes(tool)) {
       return {
         jsonrpc: "2.0",
         id,
         error: { code: -32602, message: `unknown tool: ${String(tool)}` },
+      };
+    }
+
+    if (tool === UPLOAD_TOOL.name) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: await uploadResult(params?.arguments?.paths),
+      };
+    }
+
+    if (tool === UPLOAD_STATUS_TOOL.name) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: await uploadStatusResult(params?.arguments?.upload_id),
       };
     }
 
