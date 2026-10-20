@@ -12,44 +12,45 @@
 //   * a machine with no key gets a sentence it can act on, not a stack trace;
 //   * a spent balance says so rather than returning an empty result.
 //
-// And five more for the update check, which is the one thing here that talks to a
-// service this product does not own: a customer's copy is a *copy*, and a copy
-// that never learns it is behind is what the check exists to fix. The rest of
-// those tests are about the check staying invisible when it cannot answer.
-import { spawn } from "node:child_process";
+// And four about distribution: the default backend is the deployed one, the
+// published copy is byte-for-byte the source with the checksum the install sheet
+// names, the server reaches for no branch, and it checks for updates only when a
+// human runs `--check-update`. A copy of this file runs with a customer's key and
+// filesystem access, so it must not fetch code or phone home on its own.
+import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 const SERVER = resolve(import.meta.dirname, "mcp.mjs");
+const execFileAsync = promisify(execFile);
+
+/**
+ * Whether this checkout is the frontend, or the mirror published from it.
+ *
+ * `mcp.mjs` and this file are also published to `retrievr-io/retrievr_mcp`, and the
+ * two suites that check distribution below read `../README.md`, `../mcp-release.json`
+ * and `../public/mcp/` — none of which exist in the mirror. They skip there instead
+ * of failing: a test file that cannot pass in the mirror cannot be published to it,
+ * and `sync-to-retrievr-mcp.sh` runs this file as its gate before pushing.
+ */
+const HAS_FRONTEND = existsSync(new URL("../mcp-release.json", import.meta.url));
+const FRONTEND_ONLY = "only in the frontend checkout, where the copy is published from";
 
 /**
  * The version the server reports, read out of the server rather than written here.
  *
- * A hardcoded copy is how these tests go quietly vacuous: bump the release and the
- * "stays quiet when this copy is the latest" case starts passing because the copy is
- * now *newer* than the feed, which asserts nothing. Read this way, a bump moves the
- * tests with it — the same extraction the sync script does before it publishes.
+ * The published copy and `mcp-release.json` are pinned to it, so a bump has to move
+ * all three together. Reading it from the source makes the test assert that instead
+ * of comparing a hardcoded copy against itself.
  */
 const VERSION = /^const VERSION = "(.+)";$/m.exec(readFileSync(SERVER, "utf8"))?.[1];
 assert.equal(typeof VERSION, "string", "mcp.mjs has no VERSION to test against");
-
-/**
- * A release newer than this copy, derived rather than written down.
- *
- * These tests are about the check noticing a newer release; a hardcoded version
- * stops asserting that the moment the copy is bumped past it (0.2.0 is not newer
- * than a 0.2.0 copy, and the "newer" case would pass while proving the opposite).
- * Derived, a bump moves the tests with it.
- */
-const NEWER_VERSION = (() => {
-  const parts = VERSION.split(".").map(Number);
-  parts[2] += 1;
-  return parts.join(".");
-})();
 
 const RESULT = {
   chunk_id: "158678",
@@ -262,7 +263,7 @@ function startClient({
   // Isolated by default: a client that inherited the real home directory would
   // read and write the operator's own ~/.config/retrievr on every test run.
   configDir = mkdtempSync(join(tmpdir(), "retrievr-cfg-")),
-  releaseUrl,
+  env = {},
 }) {
   const child = spawn(process.execPath, [SERVER], {
     env: {
@@ -270,10 +271,7 @@ function startClient({
       RETRIEVR_FUNCTIONS_URL: url,
       RETRIEVR_API_KEY: key ?? "",
       RETRIEVR_CONFIG_DIR: configDir,
-      // Offline unless a test says otherwise. The real endpoint is api.github.com,
-      // and a suite that asked it once per spawn would be rate-limited and flaky by
-      // turns. Port 9 is discard: it refuses immediately.
-      RETRIEVR_MCP_LATEST_URL: releaseUrl ?? "http://127.0.0.1:9/releases/latest",
+      ...env,
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -768,164 +766,197 @@ describe("the retrievr MCP server", async () => {
   });
 });
 
-/** A stub of GitHub's latest-release endpoint, counting how often it is asked. */
-async function startReleaseFeed({ mode = "newer" } = {}) {
-  const state = { asks: 0 };
+/**
+ * The backend the published copy talks to.
+ *
+ * It is a hardcoded default because the file has to work with no environment set,
+ * and it has already shipped stale once: a key minted against the live project
+ * reached the other one and came back 401. README.md names the deployed origin, so
+ * the two are pinned together here.
+ */
+describe("the default backend", { skip: HAS_FRONTEND ? false : FRONTEND_ONLY }, () => {
+  it("is the deployment the rest of the product uses", () => {
+    const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+    const deployed = /`RETRIEVR_FUNCTIONS_URL`\s*\|\s*`([^`]+)`/.exec(readme)?.[1];
+    assert.ok(deployed, "README.md does not name RETRIEVR_FUNCTIONS_URL");
 
-  const server = createServer((request, response) => {
-    state.asks += 1;
-    if (!request.url.startsWith("/releases/latest")) {
-      return response.writeHead(404, { "content-type": "application/json" }).end("{}");
+    const source = readFileSync(SERVER, "utf8");
+    const fallback = /^const DEFAULT_BASE_URL = "(.+)";$/m.exec(source)?.[1];
+    assert.equal(fallback, deployed);
+  });
+});
+
+/**
+ * Distribution, not behaviour: the file a customer runs is published under its
+ * version with a checksum, and the install sheet names both. These tests are what
+ * make "pinned" true rather than aspirational.
+ */
+describe("the published copy", { skip: HAS_FRONTEND ? false : FRONTEND_ONLY }, () => {
+  // Read inside the tests rather than at describe time: `describe` registers its
+  // callback even when the suite is skipped, and the file it names is not there.
+  const release = () =>
+    JSON.parse(readFileSync(new URL("../mcp-release.json", import.meta.url), "utf8"));
+  const source = readFileSync(SERVER);
+  const routeFile = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
+
+  it("is the source, byte for byte", () => {
+    const pinned = release();
+    assert.equal(pinned.version, VERSION);
+    const published = readFileSync(
+      new URL(`../public/mcp/v${pinned.version}/mcp.mjs`, import.meta.url),
+    );
+    assert.ok(
+      published.equals(source),
+      `public/mcp/v${pinned.version}/mcp.mjs is stale — run node scripts/publish-mcp.mjs`,
+    );
+  });
+
+  it("carries the checksum the install sheet names", () => {
+    const digest = createHash("sha256").update(source).digest("hex");
+    assert.equal(release().sha256, digest);
+  });
+
+  it("publishes the feed the explicit check reads", () => {
+    const feed = JSON.parse(readFileSync(new URL("../public/mcp/release.json", import.meta.url), "utf8"));
+    assert.deepEqual(feed, release());
+  });
+
+  it("reaches for no branch and no background check", () => {
+    const text = source.toString("utf8");
+    assert.doesNotMatch(text, /raw\.githubusercontent\.com|api\.github\.com/);
+    assert.doesNotMatch(text, /RETRIEVR_MCP_LATEST_URL|update-check\.json/);
+    assert.match(text, /https:\/\/retrievr\.io\/mcp\/release\.json/);
+  });
+
+  it("is installed from this site, at the pinned path", () => {
+    const install = routeFile("../app/install/route.ts");
+    assert.match(install, /from "@\/mcp-release\.json"/);
+    assert.match(install, /release\.path/);
+    assert.match(install, /--check-update/);
+    assert.doesNotMatch(install, /raw\.githubusercontent\.com|RETRIEVR_MCP_URL/);
+  });
+
+  it("is not refreshed by the connect script", () => {
+    const connect = routeFile("../app/connect/route.ts");
+    assert.doesNotMatch(connect, /raw\.githubusercontent\.com|MCP_URL|refresh_mcp/);
+  });
+});
+
+/**
+ * Updating is deliberate, not automatic.
+ *
+ * The server must not phone home during a normal session, and the explicit check
+ * must work for a human who asks. These tests are the two halves of that promise.
+ */
+describe("the explicit update path", () => {
+  const NEXT_VERSION = (() => {
+    const parts = VERSION.split(".").map(Number);
+    parts[2] += 1;
+    return parts.join(".");
+  })();
+
+  /** A release feed on localhost, counting how often it is asked. */
+  async function startFeed(release) {
+    const state = { asks: 0 };
+    const server = createServer((request, response) => {
+      state.asks += 1;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(release));
+    });
+    await new Promise((done) => server.listen(0, "127.0.0.1", done));
+    return {
+      state,
+      url: `http://127.0.0.1:${server.address().port}/release.json`,
+      close: () => new Promise((done) => server.close(done)),
+    };
+  }
+
+  /**
+   * The CLI, run asynchronously.
+   *
+   * Not `spawnSync`: the release feed in these tests is a server in *this*
+   * process, and a synchronous child would block the event loop that has to
+   * answer it. The check would then time out against a server that is right here.
+   */
+  async function run(args, feed) {
+    try {
+      const { stdout, stderr } = await execFileAsync(process.execPath, [SERVER, ...args], {
+        env: { ...process.env, RETRIEVR_MCP_UPDATE_FEED: feed ?? "http://127.0.0.1:9/release.json" },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      return { status: 0, stdout, stderr };
+    } catch (cause) {
+      return {
+        status: typeof cause.code === "number" ? cause.code : 1,
+        stdout: cause.stdout ?? "",
+        stderr: cause.stderr ?? "",
+      };
     }
-    if (mode === "broken") {
-      return response.writeHead(500, { "content-type": "application/json" }).end("{}");
+  }
+
+  it("says what this copy is, without touching the network", async () => {
+    const answer = await run(["--version"]);
+    assert.equal(answer.status, 0);
+    assert.equal(answer.stdout.trim(), `retrievr ${VERSION}`);
+  });
+
+  it("names the newer release when a human asks", async () => {
+    const feed = await startFeed({
+      version: NEXT_VERSION,
+      sha256: "a".repeat(64),
+      path: `/mcp/v${NEXT_VERSION}/mcp.mjs`,
+    });
+    try {
+      const answer = await run(["--check-update"], feed.url);
+      assert.equal(answer.status, 0);
+      assert.match(answer.stdout, new RegExp(`${NEXT_VERSION} is available`));
+      assert.match(answer.stdout, new RegExp(`this copy is ${VERSION.replaceAll(".", "\\.")}`));
+      assert.match(answer.stdout, /https:\/\/retrievr\.io\/install/);
+      assert.match(answer.stdout, new RegExp(`/mcp/v${NEXT_VERSION.replaceAll(".", "\\.")}/mcp\\.mjs`));
+      assert.equal(feed.state.asks, 1);
+    } finally {
+      await feed.close();
     }
-    // "unreadable" is a tag that is not a version — a nightly, say. A tag nobody
-    // can compare is a tag to say nothing about.
-    const tag_name = mode === "newer" ? `v${NEWER_VERSION}` : mode === "current" ? `v${VERSION}` : "nightly";
-    return response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ tag_name }));
   });
 
-  await new Promise((done) => server.listen(0, "127.0.0.1", done));
-  return {
-    state,
-    url: `http://127.0.0.1:${server.address().port}/releases/latest`,
-    close: () => new Promise((done) => server.close(done)),
-  };
-}
-
-describe("the update check", async () => {
-  let upstream;
-
-  before(async () => {
-    upstream = await startUpstream();
+  it("says up to date when this copy is the latest", async () => {
+    const feed = await startFeed({ version: VERSION, sha256: "a".repeat(64), path: "/mcp/x" });
+    try {
+      const answer = await run(["--check-update"], feed.url);
+      assert.equal(answer.status, 0);
+      assert.match(answer.stdout, /up to date/);
+    } finally {
+      await feed.close();
+    }
   });
 
-  after(async () => {
-    await upstream.close();
+  it("shows the failure when the explicit check cannot answer", async () => {
+    const answer = await run(["--check-update"], "http://127.0.0.1:9/release.json");
+    assert.equal(answer.status, 1);
+    assert.match(answer.stderr, /could not check for updates/);
   });
 
-  /** One client, initialized, with a release feed it can be pointed at. */
-  async function clientOn(feed, configDir) {
+  it("does not check at all during a normal session", async () => {
+    const feed = await startFeed({ version: NEXT_VERSION, sha256: "a".repeat(64), path: "/mcp/x" });
+    const upstream = await startUpstream();
     const client = startClient({
       url: upstream.url,
       key: "rtv_live_test",
-      configDir,
-      releaseUrl: feed?.url,
+      env: { RETRIEVR_MCP_UPDATE_FEED: feed.url },
     });
-    await client.request("initialize", {
-      protocolVersion: "2025-06-18",
-      capabilities: {},
-      clientInfo: { name: "test", version: "1" },
-    });
-    return client;
-  }
-
-  const search = (client, query) =>
-    client
-      .request("tools/call", { name: "retrievr_search", arguments: { query } })
-      .then(textOf);
-
-  it("tells the human once when a newer release exists", async () => {
-    const feed = await startReleaseFeed({ mode: "newer" });
-    const client = await clientOn(feed, mkdtempSync(join(tmpdir(), "retrievr-upd-")));
     try {
-      const first = await search(client, "a question");
-      // The line names both versions, because "update available" without them is
-      // something a reader cannot act on or check.
-      assert.match(first, new RegExp(`${NEWER_VERSION.replaceAll(".", "\\.")} is available`));
-      // And names the copy it is talking about, which is the only way the human
-      // knows which of their machines is behind.
-      assert.ok(first.includes(VERSION), "the notice does not name this copy's version");
-      // And the answer is still the answer.
-      assert.match(first, /Declaration of Independence/);
-
-      // Once per session: this is a line the model relays to the human, not a
-      // footnote bolted to every passage for the rest of the day.
-      const second = await search(client, "another question");
-      assert.doesNotMatch(second, /is available/);
-
-      assert.equal(feed.state.asks, 1);
+      await client.request("initialize", {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "test", version: "1" },
+      });
+      // Starting up and shaking hands is not a reason to ask anything.
+      assert.equal(feed.state.asks, 0);
     } finally {
       client.close();
+      await upstream.close();
       await feed.close();
-    }
-  });
-
-  it("checks at most once a day", async () => {
-    // The cache is the whole point of the check being affordable: a customer who
-    // asks ten questions in an afternoon asks GitHub once.
-    const dir = mkdtempSync(join(tmpdir(), "retrievr-cache-"));
-    writeFileSync(
-      join(dir, "update-check.json"),
-      JSON.stringify({ checkedAt: Date.now(), latest: NEWER_VERSION }),
-    );
-
-    const feed = await startReleaseFeed({ mode: "newer" });
-    const client = await clientOn(feed, dir);
-    try {
-      const text = await search(client, "a question");
-      assert.match(text, new RegExp(`${NEWER_VERSION.replaceAll(".", "\\.")} is available`));
-      assert.equal(feed.state.asks, 0, "a fresh cache means GitHub is not asked");
-    } finally {
-      client.close();
-      await feed.close();
-    }
-  });
-
-  it("remembers what it learned, so the next session starts quiet", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "retrievr-remember-"));
-    const feed = await startReleaseFeed({ mode: "newer" });
-    const client = await clientOn(feed, dir);
-    try {
-      await search(client, "a question");
-      const written = JSON.parse(readFileSync(join(dir, "update-check.json"), "utf8"));
-      assert.equal(written.latest, NEWER_VERSION);
-      assert.equal(typeof written.checkedAt, "number");
-    } finally {
-      client.close();
-      await feed.close();
-    }
-  });
-
-  it("never lets a failed check reach the user", async () => {
-    // GitHub being down, rate-limited, or answering nonsense must cost a search
-    // nothing at all. A retrieval that reports a version check is worse than no
-    // version check.
-    for (const mode of ["broken", "unreadable"]) {
-      const feed = await startReleaseFeed({ mode });
-      const client = await clientOn(feed, mkdtempSync(join(tmpdir(), "retrievr-quiet-")));
-      try {
-        const text = await search(client, "a question");
-        assert.doesNotMatch(text, /is available/, `mode ${mode} leaked a notice`);
-        assert.match(text, /Declaration of Independence/);
-      } finally {
-        client.close();
-        await feed.close();
-      }
-    }
-  });
-
-  it("stays quiet when this copy is the latest", async () => {
-    const feed = await startReleaseFeed({ mode: "current" });
-    const client = await clientOn(feed, mkdtempSync(join(tmpdir(), "retrievr-current-")));
-    try {
-      assert.doesNotMatch(await search(client, "a question"), /is available/);
-    } finally {
-      client.close();
-      await feed.close();
-    }
-  });
-
-  it("survives an unreachable GitHub", async () => {
-    // No feed at all: startClient points at a refused port. The search still
-    // answers, which is the property that matters on a customer's machine behind
-    // a firewall.
-    const client = await clientOn(undefined, mkdtempSync(join(tmpdir(), "retrievr-offline-")));
-    try {
-      assert.match(await search(client, "a question"), /Declaration of Independence/);
-    } finally {
-      client.close();
     }
   });
 });

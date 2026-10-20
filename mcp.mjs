@@ -14,8 +14,9 @@
 //     install is what authenticates it. The same reason `retrieve.mjs` reads the
 //     file per run.
 //   * **The submit-then-poll pair is hidden here.** `/retrieve` is asynchronous
-//     because the embedding ran on a scale-to-zero GPU — submit, get a job id,
-//     poll. A model wants one answer, so the job id never crosses this boundary.
+//     because one Edge Function request has a 150 s window and an upload on the same
+//     GPU must not be able to sit in front of a query — submit, get a job id, poll.
+//     A model wants one answer, so the job id never crosses this boundary.
 //   * **A failure is a tool result, not a JSON-RPC error.** A JSON-RPC error is
 //     what a harness renders as a broken server; a result is what the model reads
 //     and acts on. "You have no key yet, here is the line to run" is only useful
@@ -23,7 +24,7 @@
 //     which is a programming error in the caller.
 //
 // stdout is the protocol channel. Anything that is not JSON-RPC goes to stderr.
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -37,23 +38,23 @@ const SERVER_NAME = "retrievr";
 /**
  * What this copy is.
  *
- * The customer holds a *copy* of this file — that is the shape we chose over a
- * hosted endpoint — so the copy has to be able to learn that it is behind. This
- * constant is the source of truth for both sides of that: the handshake reports
- * it, and the release tag is cut from it. It is also why there is no second
- * version string in here to drift away from the first.
+ * The published file is served from a version-pinned path, and the install sheet
+ * names this version and its SHA-256 so the human can check what they fetched.
+ * The handshake reports the same string. It is the only version string here, so
+ * there is nothing for it to drift away from.
  */
-const VERSION = "0.2.0";
+const VERSION = "0.2.3";
 
 /**
  * The deployment, unless told otherwise.
  *
  * Defaulted rather than required, because the alternative is a `mcp.json` entry
  * carrying an environment variable that a customer has to get right before the
- * tool works at all. The connect script ships the same default for the same
- * reason.
+ * tool works at all. This must name the live project: a stale default sends a
+ * fresh key to the wrong backend and comes back 401 invalid_api_key. A test pins
+ * it to the deployed functions origin in the frontend's environment.
  */
-const DEFAULT_BASE_URL = "https://drqkocyrytmbvlmasoyv.supabase.co/functions/v1";
+const DEFAULT_BASE_URL = "https://xihzxccadrvfvymspepx.supabase.co/functions/v1";
 
 const TOOL_NAME = "retrievr_search";
 
@@ -160,132 +161,6 @@ const NO_KEY = [
   "~/.config/retrievr/credentials and never prints it. This tool will work on the",
   "next call — it reads the key each time and does not need restarting.",
 ].join(" ");
-
-// --- telling a copy that it is behind ---------------------------------------
-
-/**
- * Where the released copy lives, and what it is called.
- *
- * The repository is private while this is being built, so an anonymous call here
- * answers 404 and the check says nothing. That is the intended reading of a 404
- * in this file, not an error: see `checkForUpdate`.
- */
-const REPO = "retrievr-io/retrievr_mcp";
-const LATEST_RELEASE_URL =
-  process.env.RETRIEVR_MCP_LATEST_URL ?? `https://api.github.com/repos/${REPO}/releases/latest`;
-
-/**
- * A day between checks, and three seconds to answer.
- *
- * The day is what makes the check affordable: a customer who asks ten questions
- * in an afternoon asks GitHub once. The three seconds is the whole of the risk
- * this file takes on a network it does not own — everything after it fails quiet.
- */
-const UPDATE_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
-const UPDATE_CHECK_TIMEOUT_MS = 3000;
-const UPDATE_CACHE_FILE = "update-check.json";
-
-/** `v0.2.0` → `0.2.0`. A tag that is not x.y.z is a tag we say nothing about. */
-function versionOf(tag) {
-  return /^v?(\d+\.\d+\.\d+)$/.exec(String(tag ?? "").trim())?.[1];
-}
-
-/** Part by part, numerically: 0.10.0 is newer than 0.9.0, which a string compare gets wrong. */
-function isNewer(latest, current) {
-  const [a, b] = [latest, current].map((version) => version.split(".").map(Number));
-  for (let part = 0; part < 3; part += 1) {
-    if (a[part] !== b[part]) return a[part] > b[part];
-  }
-  return false;
-}
-
-/** The sentence a human needs: both versions, and what to do about it. */
-function noticeFor(latest) {
-  return (
-    `retrievr-mcp ${latest} is available — this copy is ${VERSION}. ` +
-    "Update it by re-running the install line from https://retrievr.io/install."
-  );
-}
-
-function readUpdateCache() {
-  try {
-    const cached = JSON.parse(readFileSync(join(configDir(), UPDATE_CACHE_FILE), "utf8"));
-    if (typeof cached?.checkedAt !== "number" || typeof cached?.latest !== "string") {
-      return undefined;
-    }
-    return cached;
-  } catch {
-    return undefined; // absent, or not ours — either way it is a check to make
-  }
-}
-
-function writeUpdateCache(latest) {
-  try {
-    mkdirSync(configDir(), { recursive: true });
-    writeFileSync(
-      join(configDir(), UPDATE_CACHE_FILE),
-      `${JSON.stringify({ checkedAt: Date.now(), latest })}\n`,
-    );
-  } catch {
-    // A cache that cannot be written is a check made twice, not a failed search.
-  }
-}
-
-/**
- * What the latest release is, asked at most once a day, and never in a way that
- * can be noticed.
- *
- * Every failure here is silence, on purpose. GitHub can be unreachable, rate
- * limited (sixty anonymous calls an hour), or holding a tag nobody can parse, and
- * while the repository is private it answers 404 to everyone but us. None of that
- * is the customer's problem and none of it may reach their answer — a retrieval
- * that reports on a version check is worse than one that never checks.
- *
- * A stale answer beats no answer, so a cache that has aged out is still the
- * fallback when the network will not speak.
- */
-async function checkForUpdate() {
-  const cached = readUpdateCache();
-  if (cached !== undefined && Date.now() - cached.checkedAt < UPDATE_CHECK_TTL_MS) {
-    return cached.latest;
-  }
-
-  try {
-    const response = await fetch(LATEST_RELEASE_URL, {
-      headers: { accept: "application/vnd.github+json" },
-      signal: AbortSignal.timeout(UPDATE_CHECK_TIMEOUT_MS),
-    });
-    if (!response.ok) return cached?.latest;
-
-    const latest = versionOf((await response.json())?.tag_name);
-    if (latest === undefined) return cached?.latest;
-
-    writeUpdateCache(latest);
-    return latest;
-  } catch {
-    return cached?.latest; // offline, refused, or slower than we were willing to wait
-  }
-}
-
-/**
- * The check, started when the process starts and awaited by the first tool call.
- *
- * Started here rather than on the first call so that it overlaps the session
- * starting up — and awaited there rather than here so that the handshake is never
- * held open by a network we do not own. `catch` because a rejection here would
- * travel into that tool call through `Promise.all`, and nothing about an update
- * check is worth failing a search over.
- */
-const updateCheck = checkForUpdate().catch(() => undefined);
-
-let noticeShown = false;
-
-/** The line to add to an answer, or nothing. Once per session, and never a downgrade. */
-function updateNotice(latest) {
-  if (noticeShown || latest === undefined || !isNewer(latest, VERSION)) return undefined;
-  noticeShown = true;
-  return noticeFor(latest);
-}
 
 function explain(status, detail) {
   const because =
@@ -1141,17 +1016,12 @@ async function handle(message) {
       return { jsonrpc: "2.0", id, result: textResult(scoped.error, true) };
     }
 
-    // The check was started at startup and has at most three seconds to answer,
-    // so this costs the first call the *difference* between the two waits rather
-    // than their sum. It is also the only place the notice can be delivered: stderr
-    // goes to a log nobody reads, and a harness shows the model the tool result.
-    const [outcome, latest] = await Promise.all([search(query, k, scoped.scope), updateCheck]);
+    const outcome = await search(query, k, scoped.scope);
     const text = outcome.ok ? format(outcome.results, outcome.retrieval_ms) : outcome.message;
-    const notice = updateNotice(latest);
     // The scope line is appended to a *successful* answer only: on a failure the
     // message already says what went wrong, and "scope: documents" beside "nothing
     // retrieved" reads as if the scope were the reason.
-    const body = [text, outcome.ok ? scoped.note : undefined, notice].filter(Boolean).join("\n\n");
+    const body = [text, outcome.ok ? scoped.note : undefined].filter(Boolean).join("\n\n");
 
     return {
       jsonrpc: "2.0",
@@ -1174,37 +1044,109 @@ function write(message) {
   if (message !== undefined) process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
-// Serialized: a tools/call can take seconds, and two answers must not interleave
-// on one line of stdout.
-let queue = Promise.resolve();
-const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+// --- the explicit update path ------------------------------------------------
+//
+// There is no background check. A copy of this file runs on a customer's machine
+// and must not phone home on its own, so updating is something a person asks for:
+//
+//   node mcp.mjs --version          what this copy is
+//   node mcp.mjs --check-update     asks retrievr.io once, now, because you asked
+//
+// The feed is our own origin, not a branch and not a third party. It names the
+// current version, the pinned path and the SHA-256 the install sheet prints.
+const RELEASE_FEED_URL =
+  process.env.RETRIEVR_MCP_UPDATE_FEED ?? "https://retrievr.io/mcp/release.json";
 
-lines.on("line", (line) => {
-  const trimmed = line.trim();
-  if (trimmed === "") return;
+/** Part by part, numerically: 0.10.0 is newer than 0.9.0, which a string compare gets wrong. */
+function isNewer(candidate, current) {
+  const [a, b] = [candidate, current].map((version) => version.split(".").map(Number));
+  for (let part = 0; part < 3; part += 1) {
+    if (a[part] !== b[part]) return a[part] > b[part];
+  }
+  return false;
+}
 
-  queue = queue.then(async () => {
-    let message;
-    try {
-      message = JSON.parse(trimmed);
-    } catch {
-      write({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
-      return;
-    }
-    try {
-      write(await handle(message));
-    } catch (cause) {
-      // A bug here is ours, not the caller's, and it still has to be told.
-      if (message.id !== undefined) {
-        write({
-          jsonrpc: "2.0",
-          id: message.id,
-          error: { code: -32603, message: `internal error: ${cause.message}` },
-        });
-      }
-    }
+/** The published release, read only when a human runs `--check-update`. */
+async function checkForUpdate() {
+  const response = await fetch(RELEASE_FEED_URL, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(5000),
   });
-});
+  if (!response.ok) throw new Error(`the release feed answered HTTP ${response.status}`);
 
-// The harness closing the pipe is the client leaving.
-lines.on("close", () => queue.finally(() => process.exit(0)));
+  const release = await response.json();
+  if (!/^\d+\.\d+\.\d+$/.test(release?.version ?? "")) {
+    throw new Error("the release feed did not name a version");
+  }
+  return release;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+
+  if (args.includes("--version")) {
+    process.stdout.write(`${SERVER_NAME} ${VERSION}\n`);
+    return;
+  }
+
+  if (args.includes("--check-update")) {
+    try {
+      const release = await checkForUpdate();
+      const verdict = isNewer(release.version, VERSION)
+        ? `${release.version} is available — this copy is ${VERSION}. ` +
+          "Update it by re-running https://retrievr.io/install."
+        : "up to date.";
+      process.stdout.write(`${SERVER_NAME} ${VERSION} — ${verdict}\n`);
+      if (release.path !== undefined) {
+        process.stdout.write(`  ${release.path}  sha256 ${release.sha256 ?? "unknown"}\n`);
+      }
+    } catch (cause) {
+      // Explicit means the failure is visible: this ran because someone asked.
+      process.stderr.write(`${SERVER_NAME}: could not check for updates: ${cause.message}\n`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  serve();
+}
+
+// The stdio server, started only when no flag asked for something else.
+function serve() {
+  // Serialized: a tools/call can take seconds, and two answers must not interleave
+  // on one line of stdout.
+  let queue = Promise.resolve();
+  const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+
+  lines.on("line", (line) => {
+    const trimmed = line.trim();
+    if (trimmed === "") return;
+
+    queue = queue.then(async () => {
+      let message;
+      try {
+        message = JSON.parse(trimmed);
+      } catch {
+        write({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
+        return;
+      }
+      try {
+        write(await handle(message));
+      } catch (cause) {
+        // A bug here is ours, not the caller's, and it still has to be told.
+        if (message.id !== undefined) {
+          write({
+            jsonrpc: "2.0",
+            id: message.id,
+            error: { code: -32603, message: `internal error: ${cause.message}` },
+          });
+        }
+      }
+    });
+  });
+
+  // The harness closing the pipe is the client leaving.
+  lines.on("close", () => queue.finally(() => process.exit(0)));
+}
+
+main();

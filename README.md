@@ -49,13 +49,24 @@ process and it exits when your session does.
 
 ## Updating
 
-This copy asks GitHub for the latest release **once a day**, and says so on your
-next search if it is behind. It never updates itself and never blocks a search: if
-GitHub is unreachable, rate-limited or private, the check says nothing at all.
+This copy does not check for updates on its own and makes no network calls of its
+own during normal use: it talks to retrievr when you call a tool, and nowhere
+else.
 
-To update, re-run the install line — the connect step also refreshes this file.
+To check whether a newer release exists, without starting the server:
 
-The version of this copy is **0.2.0**.
+```bash
+node ~/.config/retrievr/mcp.mjs --check-update
+```
+
+That asks retrievr.io once, because you asked it to. It prints the version it
+found, the pinned path and its SHA-256.
+
+To update, re-run the install line from <https://retrievr.io/install>. It fetches
+the current release from a version-pinned path and prints the SHA-256 of the
+exact bytes; the download step refuses a file that does not match.
+
+The version of this copy is **0.2.3**.
 
 ## Search settings
 
