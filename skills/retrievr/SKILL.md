@@ -52,7 +52,9 @@ fill the gap from memory.
 `retrievr_upload` takes `paths` — local paths the user named, with `~/` expanded. The
 server reads the files itself, so contents never pass through the conversation; what
 comes back is an upload id and a sentence. PDF, EPUB, plain text and Markdown, up to
-50 MB each and 20 files per call. Uploading needs a funded account.
+50 MB each and 20 files per call. Uploading is free: the account's first five
+documents need no payment, and after that a $5 top-up unlocks the rest, up to a
+library of 20.
 
 Embedding is asynchronous: call `retrievr_upload_status` with the upload id. A file
 that could not be read was not added, so it can be sent again.
