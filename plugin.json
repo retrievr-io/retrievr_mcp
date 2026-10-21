@@ -1,0 +1,13 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "retrievr",
+  "version": "0.2.4",
+  "description": "Search openly licensed documents and your own library, and get passages back with their citation — source, author, section, character range and licence.",
+  "author": {
+    "name": "retrievr",
+    "url": "https://retrievr.io"
+  },
+  "homepage": "https://retrievr.io",
+  "repository": "https://github.com/retrievr-io/retrievr_mcp",
+  "keywords": ["retrieval", "rag", "citations", "documents", "search", "mcp"]
+}

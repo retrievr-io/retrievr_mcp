@@ -43,6 +43,12 @@ For pi, the command that writes that entry is:
 pi mcp add retrievr -- node ~/.config/retrievr/mcp.mjs
 ```
 
+For harnesses that load Agent Plugins this repository is one: `plugin.json` names
+it, `mcp.json` declares the server above with the `mcp.mjs` that travels beside it,
+and `skills/retrievr/` says when to reach for the tools. That route needs no file
+under your home directory — the key is still read from
+`~/.config/retrievr/credentials`, or from `$RETRIEVR_API_KEY`.
+
 Reload your harness afterwards — the tool list is read when a session starts.
 Nothing is installed globally, and there is no daemon: your harness starts this
 process and it exits when your session does.
