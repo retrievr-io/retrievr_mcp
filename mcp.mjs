@@ -43,7 +43,7 @@ const SERVER_NAME = "retrievr";
  * The handshake reports the same string. It is the only version string here, so
  * there is nothing for it to drift away from.
  */
-const VERSION = "0.2.3";
+const VERSION = "0.2.4";
 
 /**
  * The deployment, unless told otherwise.
@@ -885,9 +885,9 @@ const UPLOAD_TOOL = {
     "Add the user's own files to their private retrievr library, where their searches can find " +
     "them with citations. Pass the local paths of files the user named. This server reads each " +
     "file and sends it straight to retrievr, so its contents never pass through the conversation. " +
-    "Accepts PDF, EPUB, plain text and Markdown, up to 50 MB each and 20 files in one call; the " +
-    "library holds 20 documents. Uploading is free, but only enabled once the account has been " +
-    "funded. Embedding is asynchronous: this returns an upload id, and retrievr_upload_status says " +
+    "Accepts PDF, EPUB, plain text and Markdown, up to 50 MB each. Uploading is free: " +
+    "the account's first five documents need no payment, and after that a $5 top-up " +
+    "unlocks the rest. Embedding is asynchronous: this returns an upload id, and retrievr_upload_status says " +
     "when the documents are ready to search. Never upload a file the user did not ask for.",
   inputSchema: {
     type: "object",

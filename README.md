@@ -66,7 +66,7 @@ To update, re-run the install line from <https://retrievr.io/install>. It fetche
 the current release from a version-pinned path and prints the SHA-256 of the
 exact bytes; the download step refuses a file that does not match.
 
-The version of this copy is **0.2.3**.
+The version of this copy is **0.2.4**.
 
 ## Search settings
 

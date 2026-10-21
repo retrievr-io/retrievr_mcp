@@ -185,8 +185,8 @@ async function startUpstream() {
         return send(403, {
           error: "uploads_not_enabled",
           message:
-            "Uploads are enabled once the account has been funded. Add $10 of credit at " +
-            "https://retrievr.io/profile.",
+            "A library starts with 5 free documents. Add $5 of credit at " +
+            "https://retrievr.io/profile to upload more.",
         });
       }
       if (state.uploadMode === "unsupported") {
@@ -685,7 +685,7 @@ describe("the retrievr MCP server", async () => {
       });
       assert.equal(answer.result.isError, true);
       // The sentence names what to do and where, which is what an agent has to relay.
-      assert.match(textOf(answer), /funded/i);
+      assert.match(textOf(answer), /\$5/);
       assert.match(textOf(answer), /retrievr\.io\/profile/);
       // Refused at the init means no bytes were read or sent.
       assert.equal(upstream.state.uploadedBytes.length, before);
