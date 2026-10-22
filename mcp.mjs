@@ -43,7 +43,7 @@ const SERVER_NAME = "retrievr";
  * The handshake reports the same string. It is the only version string here, so
  * there is nothing for it to drift away from.
  */
-const VERSION = "0.2.4";
+const VERSION = "0.2.5";
 
 /**
  * The deployment, unless told otherwise.
@@ -792,11 +792,14 @@ const TOOL = {
   description:
     "Search retrievr and get passages back with their citation: source, author, section, " +
     "character range and licence. Use this instead of answering from memory when a question is " +
-    "about a document retrievr may hold, and cite the fields it returns. " +
-    "By default this searches the user's own documents *and* the public corpus together; pass " +
-    'scope: "private" to search only their documents, scope: "public" for only the open ' +
-    "corpus, or documents: [\"a title or id\"] to search one document or a list of them " +
-    "(use retrievr_documents to find the names).",
+    "about a document retrievr may hold, and cite the fields it returns. Carry the licence with " +
+    "any quotation, and if a result has no licence, cite its span instead of reproducing the " +
+    "text. By default this searches the user's own documents *and* the public corpus together; " +
+    'pass scope: "private" to search only their documents (when the question is about their ' +
+    "documents alone — a comparison needs the default), scope: \"public\" for only the open " +
+    'corpus, or documents: ["a title or id"] to search one document or a list of them (use ' +
+    "retrievr_documents to find the names). An empty result is an answer: if a private search " +
+    "finds nothing, say so rather than re-running it wider.",
   inputSchema: {
     type: "object",
     properties: {

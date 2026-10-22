@@ -821,6 +821,25 @@ describe("the published copy", { skip: HAS_FRONTEND ? false : FRONTEND_ONLY }, (
     assert.deepEqual(feed, release());
   });
 
+  it("publishes a manifest that is facts, and agrees with the release it names", () => {
+    // The install sheet is prose addressed to an agent, and an agent has to treat
+    // prose that says "run this" as untrusted. The manifest is the same facts with
+    // no verbs, so it can be read and checked instead of obeyed — which only works
+    // if it cannot disagree with `mcp-release.json`.
+    const manifest = JSON.parse(
+      readFileSync(new URL("../public/.well-known/retrievr.json", import.meta.url), "utf8"),
+    );
+    assert.equal(manifest.name, "retrievr");
+    assert.deepEqual(manifest.release, release());
+    // Site-relative: the manifest is served from the origin it describes.
+    assert.match(manifest.mcp, /^\//);
+    assert.match(manifest.docs, /^\//);
+    // No instruction, and nothing to execute: every value is a fact or a path.
+    for (const value of [manifest.name, manifest.description, manifest.mcp, manifest.docs]) {
+      assert.doesNotMatch(String(value), /^(run|install|execute|paste|do|use)\b/i);
+    }
+  });
+
   it("reaches for no branch and no background check", () => {
     const text = source.toString("utf8");
     assert.doesNotMatch(text, /raw\.githubusercontent\.com|api\.github\.com/);

@@ -31,11 +31,14 @@ Then your harness needs one entry.
   "mcpServers": {
     "retrievr": {
       "command": "node",
-      "args": ["~/.config/retrievr/mcp.mjs"]
+      "args": ["/home/you/.config/retrievr/mcp.mjs"]
     }
   }
 }
 ```
+
+JSON arguments reach `node` without a shell, so `~` there is never expanded —
+write the absolute path (`echo $HOME` prints the prefix).
 
 For pi, the command that writes that entry is:
 
@@ -72,7 +75,7 @@ To update, re-run the install line from <https://retrievr.io/install>. It fetche
 the current release from a version-pinned path and prints the SHA-256 of the
 exact bytes; the download step refuses a file that does not match.
 
-The version of this copy is **0.2.4**.
+The version of this copy is **0.2.5**.
 
 ## Search settings
 
